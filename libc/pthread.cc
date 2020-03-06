@@ -39,6 +39,7 @@ namespace pthread_private {
     __thread void* tsd[tsd_nkeys];
     __thread pthread_t current_pthread;
     __thread int cancel_state = PTHREAD_CANCEL_ENABLE;
+    __thread int cancel_type = PTHREAD_CANCEL_DEFERRED;
 
     // NOTE: currently, the list of keys and destructor for each is global,
     // not per shared object or ELF namespace. So if a shared object uses
@@ -639,6 +640,13 @@ int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr)
     return 0;
 }
 
+int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate)
+{
+    auto a = from_libc(attr);
+    *detachstate = a->detached ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE;
+    return 0;
+}
+
 int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate)
 {
     auto a = from_libc(attr);
@@ -729,9 +737,16 @@ int pthread_setcancelstate(int state, int *oldstate)
     return 0;
 }
 
-int pthread_setcanceltype(int state, int *oldstate)
+int pthread_setcanceltype(int type, int *oldtype)
 {
-    WARN_STUBBED();
+    if (type != PTHREAD_CANCEL_ASYNCHRONOUS &&
+        type != PTHREAD_CANCEL_DEFERRED) {
+        return EINVAL;
+    }
+    if (oldtype) {
+        (*oldtype) = cancel_type;
+    }
+    cancel_type = type;
     return 0;
 }
 
@@ -921,30 +936,45 @@ void pthread_exit(void *retval)
     t->_thread->exit();
 }
 
-int sched_get_priority_max(int policy)
-{
-    WARN_STUBBED();
-    return EINVAL;
-}
-
+// Following 4 functions provide minimal implementation
+// that ONLY covers default Linux SCHED_OTHER policy
 int sched_get_priority_min(int policy)
 {
-    WARN_STUBBED();
-    return EINVAL;
+    switch (policy) {
+        case SCHED_OTHER:
+            return 0;
+        default:
+            return EINVAL;
+    }
+}
+
+int sched_get_priority_max(int policy)
+{
+    switch (policy) {
+        case SCHED_OTHER:
+            return 0;
+        default:
+            return EINVAL;
+    }
 }
 
 int pthread_setschedparam(pthread_t thread, int policy,
         const struct sched_param *param)
 {
-    WARN_STUBBED();
-    return EINVAL;
+    switch (policy) {
+        case SCHED_OTHER:
+            return 0;
+        default:
+            return EINVAL;
+    }
 }
 
 int pthread_getschedparam(pthread_t thread, int *policy,
         struct sched_param *param)
 {
-    WARN_STUBBED();
-    return EINVAL;
+    *policy = SCHED_OTHER;
+    param->sched_priority = 0;
+    return 0;
 }
 
 int pthread_kill(pthread_t thread, int sig)

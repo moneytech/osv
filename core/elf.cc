@@ -26,13 +26,27 @@
 #include <osv/stubbing.hh>
 #include <sys/utsname.h>
 #include <osv/demangle.hh>
+#include <boost/version.hpp>
+#include <deque>
 
 #include "arch.hh"
+
+#define ELF_DEBUG_ENABLED 0
+
+#if ELF_DEBUG_ENABLED
+#define elf_debug(format,...) kprintf("ELF [tid:%d, %s]: " format, sched::thread::current()->id(), _pathname.c_str(), ##__VA_ARGS__)
+#else
+#define elf_debug(...)
+#endif
 
 TRACEPOINT(trace_elf_load, "%s", const char *);
 TRACEPOINT(trace_elf_unload, "%s", const char *);
 TRACEPOINT(trace_elf_lookup, "%s", const char *);
+TRACEPOINT(trace_elf_lookup_next, "%s", const char *);
 TRACEPOINT(trace_elf_lookup_addr, "%p", const void *);
+
+extern void* elf_start;
+extern size_t elf_size;
 
 using namespace boost::range;
 
@@ -110,12 +124,15 @@ object::object(program& prog, std::string pathname)
     , _dynamic_table(nullptr)
     , _module_index(_prog.register_dtv(this))
     , _is_executable(false)
-    , _visibility(nullptr)
+    , _visibility_thread(nullptr)
+    , _visibility_level(VisibilityLevel::Public)
 {
+    elf_debug("Instantiated\n");
 }
 
 object::~object()
 {
+    elf_debug("Removed\n");
     _prog.free_dtv(this);
 }
 
@@ -126,25 +143,69 @@ ulong object::module_index() const
 
 bool object::visible(void) const
 {
-    auto v = _visibility.load(std::memory_order_acquire);
-    return (v == nullptr) || (v == sched::thread::current());
+    auto level = _visibility_level.load(std::memory_order_acquire);
+    if (level == VisibilityLevel::Public) {
+        return true;
+    }
+
+    auto thread = _visibility_thread.load(std::memory_order_acquire);
+    if (!thread) { //Unlikely, but ...
+        return true;
+    }
+
+    auto current_thread = sched::thread::current();
+    if (level == VisibilityLevel::ThreadOnly) {
+        return thread == current_thread;
+    }
+
+    // Is current thread the same as "thread" or is it a child of it?
+    if (thread == current_thread) {
+        return true;
+    }
+
+    bool visible = false;
+    auto next_parent_id = current_thread->parent_id();
+    while (next_parent_id) {
+        sched::with_thread_by_id(next_parent_id, [&next_parent_id, &visible, thread] (sched::thread *t) {
+            if (t == thread) {
+                visible = true;
+                next_parent_id = 0;
+            } else {
+                next_parent_id = t ? t->parent_id() : 0;
+            }
+        });
+    }
+    return visible;
 }
 
-void object::setprivate(bool priv)
+void object::set_visibility(elf::VisibilityLevel visibilityLevel)
 {
-     _visibility.store(priv ? sched::thread::current() : nullptr,
+    _visibility_thread.store(visibilityLevel == VisibilityLevel::Public ? nullptr : sched::thread::current(),
              std::memory_order_release);
+    _visibility_level.store(visibilityLevel, std::memory_order_release);
 }
-
 
 template <>
 void* object::lookup(const char* symbol)
 {
-    symbol_module sm{lookup_symbol(symbol), this};
+    symbol_module sm{lookup_symbol(symbol, false), this};
     if (!sm.symbol || sm.symbol->st_shndx == SHN_UNDEF) {
         return nullptr;
     }
     return sm.relocated_addr();
+}
+
+void* object::cached_lookup(const std::string& name)
+{
+    auto cached_address_it = _cached_symbols.find(name);
+    if (cached_address_it != _cached_symbols.end()) {
+        return cached_address_it->second;
+    }
+    else {
+        void *symbol_address = lookup(name.c_str());
+        _cached_symbols[name] = symbol_address;
+        return symbol_address;
+    }
 }
 
 std::vector<Elf64_Shdr> object::sections()
@@ -211,7 +272,6 @@ memory_image::memory_image(program& prog, void* base)
     auto p = static_cast<Elf64_Phdr*>(base + _ehdr.e_phoff);
     assert(_ehdr.e_phentsize == sizeof(*p));
     _phdrs.assign(p, p + _ehdr.e_phnum);
-    set_base(base);
 }
 
 void memory_image::load_segment(const Elf64_Phdr& phdr)
@@ -254,14 +314,9 @@ void file::load_elf_header()
           || _ehdr.e_ident[EI_OSABI] == 0)) {
         throw osv::invalid_elf_error("bad os abi");
     }
-    // We currently only support running ET_DYN objects (shared library or
-    // position-independent executable). In the future we can add support for
-    // ET_EXEC (ordinary, position-dependent executables) but it will require
-    // loading them at their specified address and moving the kernel out of
-    // their way.
-    if (_ehdr.e_type != ET_DYN) {
+    if (!(_ehdr.e_type == ET_DYN || _ehdr.e_type == ET_EXEC)) {
         throw osv::invalid_elf_error(
-                "bad executable type (only shared-object or PIE supported)");
+                "bad executable type (only shared-object, PIE or non-PIE executable supported)");
     }
 }
 
@@ -284,18 +339,39 @@ void* align(void* addr, ulong align, ulong offset)
 
 }
 
+static bool intersects_with_kernel(Elf64_Addr elf_addr)
+{
+    void *addr = reinterpret_cast<void*>(elf_addr);
+    return addr >= elf_start && addr < elf_start + elf_size;
+}
+
 void object::set_base(void* base)
 {
     auto p = std::min_element(_phdrs.begin(), _phdrs.end(),
                               [](Elf64_Phdr a, Elf64_Phdr b)
                                   { return a.p_type == PT_LOAD
                                         && a.p_vaddr < b.p_vaddr; });
-    _base = align(base, p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
     auto q = std::min_element(_phdrs.begin(), _phdrs.end(),
                               [](Elf64_Phdr a, Elf64_Phdr b)
                                   { return a.p_type == PT_LOAD
                                         && a.p_vaddr > b.p_vaddr; });
+
+    if (!is_core() && is_non_pie_executable()) {
+        // Verify non-PIE executable does not collide with the kernel
+        if (intersects_with_kernel(p->p_vaddr) || intersects_with_kernel(q->p_vaddr + q->p_memsz)) {
+            abort("Non-PIE executable [%s] collides with kernel: [%p-%p] !\n",
+                    pathname().c_str(), p->p_vaddr, q->p_vaddr + q->p_memsz);
+        }
+        // Override the passed in value as the base for non-PIEs (Position Dependant Executables)
+        // needs to be set to 0 because all the addresses in it are absolute
+        _base = 0x0;
+    } else {
+        // Otherwise for kernel, PIEs and shared libraries set the base as requested by caller
+        _base = align(base, p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
+    }
+
     _end = _base + q->p_vaddr + q->p_memsz;
+    elf_debug("The base set to: 0x%016x and end: 0x%016x\n", _base, _end);
 }
 
 void* object::base() const
@@ -325,13 +401,7 @@ void file::load_segment(const Elf64_Phdr& phdr)
     ulong filesz = align_up(filesz_unaligned, mmu::page_size);
     ulong memsz = align_up(phdr.p_vaddr + phdr.p_memsz, mmu::page_size) - vstart;
 
-    unsigned perm = 0;
-    if (phdr.p_flags & PF_X)
-        perm |= mmu::perm_exec;
-    if (phdr.p_flags & PF_W)
-        perm |= mmu::perm_write;
-    if (phdr.p_flags & PF_R)
-        perm |= mmu::perm_read;
+    unsigned perm = get_segment_mmap_permissions(phdr);
 
     auto flag = mmu::mmap_fixed | (mlocked() ? mmu::mmap_populate : 0);
     mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size));
@@ -342,6 +412,7 @@ void file::load_segment(const Elf64_Phdr& phdr)
             mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm);
         }
     }
+    elf_debug("Loaded and mapped PT_LOAD segment at: 0x%016x of size: 0x%x\n", _base + vstart, filesz); //TODO: Add memory?
 }
 
 bool object::mlocked()
@@ -352,6 +423,11 @@ bool object::mlocked()
         }
     }
     return false;
+}
+
+bool object::has_non_writable_text_relocations()
+{
+    return dynamic_exists(DT_TEXTREL);
 }
 
 Elf64_Note::Elf64_Note(void *_base, char *str)
@@ -374,15 +450,25 @@ Elf64_Note::Elf64_Note(void *_base, char *str)
     }
 }
 
+extern "C" char _pie_static_tls_start, _pie_static_tls_end;
 void object::load_segments()
 {
+    elf_debug("Loading segments\n");
+    for (unsigned i = 0; i < _ehdr.e_phnum; ++i) {
+        auto &phdr = _phdrs[i];
+        if (phdr.p_type == PT_LOAD) {
+            load_segment(phdr);
+        }
+    }
+}
+
+void object::process_headers()
+{
+    elf_debug("Processing headers\n");
     for (unsigned i = 0; i < _ehdr.e_phnum; ++i) {
         auto &phdr = _phdrs[i];
         switch (phdr.p_type) {
         case PT_NULL:
-            break;
-        case PT_LOAD:
-            load_segment(phdr);
             break;
         case PT_DYNAMIC:
             _dynamic_table = reinterpret_cast<Elf64_Dyn*>(_base + phdr.p_vaddr);
@@ -419,28 +505,44 @@ void object::load_segments()
             }
             break;
         }
+        case PT_LOAD:
         case PT_PHDR:
         case PT_GNU_STACK:
         case PT_GNU_RELRO:
         case PT_GNU_EH_FRAME:
         case PT_PAX_FLAGS:
+        case PT_GNU_PROPERTY:
             break;
         case PT_TLS:
             _tls_segment = _base + phdr.p_vaddr;
             _tls_init_size = phdr.p_filesz;
             _tls_uninit_size = phdr.p_memsz - phdr.p_filesz;
+            _tls_alignment = phdr.p_align;
+            elf_debug("Found TLS segment at 0x%016x of aligned size: %x\n", _tls_segment, get_aligned_tls_size());
             break;
         default:
-            abort();
-            throw osv::invalid_elf_error("bad p_type");
+            abort("Unknown p_type in executable %s: %d\n", pathname(), phdr.p_type);
         }
     }
-    // As explained in issue #352, we currently don't correctly support TLS
-    // used in PIEs.
+    if (!is_core() && _ehdr.e_type == ET_EXEC && !_is_executable) {
+        abort("Statically linked executables are not supported!\n");
+    }
     if (_is_executable && _tls_segment) {
-        std::cout << "WARNING: " << pathname() << " is a PIE using TLS. This "
-                  << "is currently unsupported (see issue #352). Link with "
-                  << "'-shared' instead of '-pie'.\n";
+        auto app_tls_size = get_aligned_tls_size();
+        ulong pie_static_tls_maximum_size = &_pie_static_tls_end - &_pie_static_tls_start;
+        if (app_tls_size > pie_static_tls_maximum_size) {
+            // The reservation at the end of the kernel TLS is NOT big enough
+            // to hold the app static TLS. Let us calculate what the reservation should be
+            // and inform user how to relink kernel
+            auto kernel_tls_size = sched::kernel_tls_size();
+            auto kernel_tls_used_size = kernel_tls_size - pie_static_tls_maximum_size;
+            auto kernel_tls_needed_size = align_up(kernel_tls_used_size + app_tls_size, 64UL);
+            auto app_tls_needed_size = kernel_tls_needed_size - kernel_tls_used_size;
+            std::cout << "WARNING: " << pathname() << " is a PIE using TLS of size " << app_tls_size
+                  << " which is greater than the " << pie_static_tls_maximum_size << " bytes limit. "
+                  << "Either re-link the kernel by adding 'app_local_exec_tls_size=" << app_tls_needed_size
+                  << "' to ./scripts/build or re-link the app with '-shared' instead of '-pie'.\n";
+        }
     }
 }
 
@@ -468,8 +570,24 @@ void object::unload_segments()
      }
 }
 
+unsigned object::get_segment_mmap_permissions(const Elf64_Phdr& phdr)
+{
+    unsigned perm = 0;
+    if (phdr.p_flags & PF_X)
+        perm |= mmu::perm_exec;
+    if (phdr.p_flags & PF_W)
+        perm |= mmu::perm_write;
+    if (phdr.p_flags & PF_R)
+        perm |= mmu::perm_read;
+    return perm;
+}
+
 void object::fix_permissions()
 {
+    if(has_non_writable_text_relocations()) {
+        make_text_writable(false);
+    }
+
     for (auto&& phdr : _phdrs) {
         if (phdr.p_type != PT_GNU_RELRO)
             continue;
@@ -477,8 +595,21 @@ void object::fix_permissions()
         ulong vstart = align_down(phdr.p_vaddr, mmu::page_size);
         ulong memsz = align_up(phdr.p_vaddr + phdr.p_memsz, mmu::page_size) - vstart;
 
-        assert((phdr.p_flags & (PF_R | PF_W | PF_X)) == PF_R);
         mmu::mprotect(_base + vstart, memsz, mmu::perm_read);
+    }
+}
+
+void object::make_text_writable(bool flag)
+{
+    for (auto&& phdr : _phdrs) {
+        if (phdr.p_type != PT_LOAD)
+            continue;
+
+        ulong vstart = align_down(phdr.p_vaddr, mmu::page_size);
+        ulong memsz = align_up(phdr.p_vaddr + phdr.p_memsz, mmu::page_size) - vstart;
+
+        unsigned perm = get_segment_mmap_permissions(phdr);
+        mmu::mprotect(_base + vstart, memsz, flag ? perm | mmu::perm_write : perm);
     }
 }
 
@@ -549,21 +680,27 @@ static std::string demangle(const char *name) {
     return ret;
 }
 
-symbol_module object::symbol(unsigned idx)
+symbol_module object::symbol(unsigned idx, bool ignore_missing)
 {
     auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
     assert(dynamic_val(DT_SYMENT) == sizeof(Elf64_Sym));
     auto sym = &symtab[idx];
+    auto binding = symbol_binding(*sym);
+    if (binding == STB_LOCAL) {
+        return symbol_module(sym, this);
+    }
     auto nameidx = sym->st_name;
     auto name = dynamic_ptr<const char>(DT_STRTAB) + nameidx;
-    auto ret = _prog.lookup(name);
-    auto binding = symbol_binding(*sym);
+    auto ret = _prog.lookup(name, this);
     if (!ret.symbol && binding == STB_WEAK) {
         return symbol_module(sym, this);
     }
     if (!ret.symbol) {
-        abort("%s: failed looking up symbol %s\n",
-                pathname().c_str(), demangle(name).c_str());
+        if (ignore_missing) {
+            debug("%s: ignoring missing symbol %s\n", pathname().c_str(), demangle(name).c_str());
+        } else {
+            abort("%s: failed looking up symbol %s\n", pathname().c_str(), demangle(name).c_str());
+        }
     }
     return ret;
 }
@@ -582,7 +719,7 @@ symbol_module object::symbol_other(unsigned idx)
         for (auto module : ml.objects) {
             if (module == this)
                 continue; // do not match this module
-            if (auto sym = module->lookup_symbol(name)) {
+            if (auto sym = module->lookup_symbol(name, false)) {
                 ret = symbol_module(sym, module);
                 break;
             }
@@ -597,6 +734,10 @@ symbol_module object::symbol_other(unsigned idx)
 
 void object::relocate_rela()
 {
+    if(has_non_writable_text_relocations()) {
+        make_text_writable(true);
+    }
+
     auto rela = dynamic_ptr<Elf64_Rela>(DT_RELA);
     assert(dynamic_val(DT_RELAENT) == sizeof(Elf64_Rela));
     unsigned nb = dynamic_val(DT_RELASZ) / sizeof(Elf64_Rela);
@@ -612,6 +753,7 @@ void object::relocate_rela()
             abort();
         }
     }
+    elf_debug("Relocated %d symbols in DT_RELA\n", nb);
 }
 
 extern "C" { void __elf_resolve_pltgot(void); }
@@ -643,13 +785,14 @@ void object::relocate_pltgot()
         void *addr = _base + p->r_offset;
         if (bind_now) {
             // If on-load binding is requested (instead of the default lazy
-            // binding), resolve all the PLT entries now.
+            // binding), try to resolve all the PLT entries now.
+            // If symbol cannot be resolved warn about it instead of aborting
             u32 sym = info >> 32;
-            if (!arch_relocate_jump_slot(sym, addr, p->r_addend)) {
-                debug_early("relocate_pltgot(): failed jump slot relocation\n");
-                abort();
-            }
-        } else if (original_plt) {
+            auto _sym = symbol(sym, true);
+            if (arch_relocate_jump_slot(_sym, addr, p->r_addend))
+                  continue;
+        }
+        if (original_plt) {
             // Restore the link to the original plt.
             // We know the JUMP_SLOT entries are in plt order, and that
             // each plt entry is 16 bytes.
@@ -660,6 +803,7 @@ void object::relocate_pltgot()
             *static_cast<u64*>(addr) += reinterpret_cast<u64>(_base);
         }
     }
+    elf_debug("Relocated %d PLT symbols in DT_JMPREL\n", nrel);
 
     // PLTGOT resolution has a special calling convention,
     // for x64 the symbol index and some word is pushed on the stack,
@@ -688,7 +832,7 @@ void* object::resolve_pltgot(unsigned index)
         }
     }
 
-    if (!arch_relocate_jump_slot(sym, addr, slot.r_addend)) {
+    if (!arch_relocate_jump_slot(sm, addr, slot.r_addend)) {
         debug_early("resolve_pltgot(): failed jump slot relocation\n");
         abort();
     }
@@ -721,6 +865,8 @@ elf64_hash(const char *name)
     return h;
 }
 
+constexpr Elf64_Versym old_version_symbol_mask = Elf64_Versym(1) << 15;
+
 Elf64_Sym* object::lookup_symbol_old(const char* name)
 {
     auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
@@ -750,7 +896,7 @@ dl_new_hash(const char *s)
     return h & 0xffffffff;
 }
 
-Elf64_Sym* object::lookup_symbol_gnu(const char* name)
+Elf64_Sym* object::lookup_symbol_gnu(const char* name, bool self_lookup)
 {
     auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
     auto strtab = dynamic_ptr<char>(DT_STRTAB);
@@ -774,8 +920,12 @@ Elf64_Sym* object::lookup_symbol_gnu(const char* name)
     if (idx == 0) {
         return nullptr;
     }
+    auto version_symtab = (!self_lookup && dynamic_exists(DT_VERSYM)) ? dynamic_ptr<Elf64_Versym>(DT_VERSYM) : nullptr;
     do {
         if ((chains[idx] & ~1) != (hashval & ~1)) {
+            continue;
+        }
+        if (version_symtab && version_symtab[idx] & old_version_symbol_mask) { //Ignore old version symbols
             continue;
         }
         if (strcmp(&strtab[symtab[idx].st_name], name) == 0) {
@@ -785,19 +935,35 @@ Elf64_Sym* object::lookup_symbol_gnu(const char* name)
     return nullptr;
 }
 
-Elf64_Sym* object::lookup_symbol(const char* name)
+Elf64_Sym* object::lookup_symbol(const char* name, bool self_lookup)
 {
     if (!visible()) {
         return nullptr;
     }
     Elf64_Sym* sym;
     if (dynamic_exists(DT_GNU_HASH)) {
-        sym = lookup_symbol_gnu(name);
+        sym = lookup_symbol_gnu(name, self_lookup);
     } else {
         sym = lookup_symbol_old(name);
     }
     if (sym && sym->st_shndx == SHN_UNDEF) {
         sym = nullptr;
+    }
+    return sym;
+}
+
+symbol_module object::lookup_symbol_deep(const char* name)
+{
+    symbol_module sym = { lookup_symbol(name, false), this };
+    if (!sym.symbol) {
+        auto deps = this->collect_dependencies_bfs();
+        for (auto&& _obj : deps) {
+            auto symbol = _obj->lookup_symbol(name, false);
+            if (symbol) {
+                sym = { symbol, _obj };
+                break;
+            }
+        }
     }
     return sym;
 }
@@ -884,13 +1050,23 @@ static std::string dirname(std::string path)
 void object::load_needed(std::vector<std::shared_ptr<object>>& loaded_objects)
 {
     std::vector<std::string> rpath;
-    if (dynamic_exists(DT_RPATH)) {
-        std::string rpath_str = dynamic_str(DT_RPATH);
+
+    std::string rpath_str;
+    // Prefer newer DT_RUNPATH
+    if (dynamic_exists(DT_RUNPATH)) {
+        rpath_str = dynamic_str(DT_RUNPATH);
+    // Otherwise fall back to older DT_RPATH
+    } else if (dynamic_exists(DT_RPATH)) {
+        rpath_str = dynamic_str(DT_RPATH);
+    }
+
+    if (!rpath_str.empty()) {
         boost::replace_all(rpath_str, "$ORIGIN", dirname(_pathname));
         boost::split(rpath, rpath_str, boost::is_any_of(":"));
     }
     auto needed = dynamic_str_array(DT_NEEDED);
     for (auto lib : needed) {
+        elf_debug("Loading DT_NEEDED object: %s \n", lib);
         auto obj = _prog.load_object(lib, rpath, loaded_objects);
         if (obj) {
             // Keep a reference to the needed object, so it won't be
@@ -904,13 +1080,21 @@ void object::load_needed(std::vector<std::shared_ptr<object>>& loaded_objects)
 
 void object::unload_needed()
 {
-    _needed.clear();
+    elf_debug("Unloading object dependent objects \n");
     _used_by_resolve_plt_got.clear();
+    while (!_needed.empty()) {
+        _needed.pop_back();
+    }
 }
 
 ulong object::get_tls_size()
 {
     return _tls_init_size + _tls_uninit_size;
+}
+
+ulong object::get_aligned_tls_size()
+{
+    return align_up(_tls_init_size + _tls_uninit_size, _tls_alignment);
 }
 
 void object::collect_dependencies(std::unordered_set<elf::object*>& ds)
@@ -921,6 +1105,28 @@ void object::collect_dependencies(std::unordered_set<elf::object*>& ds)
             d->collect_dependencies(ds);
         }
     }
+}
+
+std::deque<elf::object*> object::collect_dependencies_bfs()
+{
+    std::unordered_set<object*> deps_set;
+    std::deque<object*> operate_queue;
+    std::deque<object*> deps;
+    operate_queue.push_back(this);
+    deps_set.insert(this);
+
+    while (!operate_queue.empty()) {
+        object* obj = operate_queue.front();
+        operate_queue.pop_front();
+        deps.push_back(obj);
+        for (auto&& d : obj->_needed) {
+            if (!deps_set.count(d.get())) {
+                deps_set.insert(d.get());
+                operate_queue.push_back(d.get());
+            }
+        }
+    }
+    return deps;
 }
 
 std::string object::soname()
@@ -946,15 +1152,19 @@ void object::run_init_funcs(int argc, char** argv)
     if (dynamic_exists(DT_INIT)) {
         auto func = dynamic_ptr<void>(DT_INIT);
         if (func) {
+            elf_debug("Executing DT_INIT function\n");
             reinterpret_cast<void(*)(int, char**)>(func)(argc, argv);
+            elf_debug("Finished executing DT_INIT function\n");
         }
     }
     if (dynamic_exists(DT_INIT_ARRAY)) {
         auto funcs = dynamic_ptr<void(*)(int, char**)>(DT_INIT_ARRAY);
         auto nr = dynamic_val(DT_INIT_ARRAYSZ) / sizeof(*funcs);
+        elf_debug("Executing %d DT_INIT_ARRAYSZ functions\n", nr);
         for (auto i = 0u; i < nr; ++i) {
             funcs[i](argc, argv);
         }
+        elf_debug("Finished executing %d DT_INIT_ARRAYSZ functions\n", nr);
     }
 }
 
@@ -964,14 +1174,17 @@ void object::run_fini_funcs()
     if (dynamic_exists(DT_FINI_ARRAY)) {
         auto funcs = dynamic_ptr<void (*)()>(DT_FINI_ARRAY);
         auto nr = dynamic_val(DT_FINI_ARRAYSZ) / sizeof(*funcs);
+        elf_debug("Executing %d DT_FINI_ARRAYSZ functions\n", nr);
         // According to the standard, call functions in reverse order.
         for (int i = nr - 1; i >= 0; --i) {
             funcs[i]();
         }
+        elf_debug("Finished executing %d DT_FINI_ARRAYSZ functions\n", nr);
     }
     if (dynamic_exists(DT_FINI)) {
         auto func = dynamic_ptr<void>(DT_FINI);
         if (func) {
+            elf_debug("Executing DT_FINI function\n");
             reinterpret_cast<void(*)()>(func)();
         }
     }
@@ -993,6 +1206,7 @@ void object::alloc_static_tls()
     if (!_static_tls && tls_size) {
         _static_tls = true;
         _static_tls_offset = _static_tls_alloc.fetch_add(tls_size, std::memory_order_relaxed);
+        elf_debug("Allocated static TLS at 0x%016x of size: 0x%x\n", _static_tls_offset, tls_size);
     }
 }
 
@@ -1012,9 +1226,9 @@ void object::init_static_tls()
         }
         static_tls |= obj->_static_tls;
         _initial_tls_size = std::max(_initial_tls_size, obj->static_tls_end());
-	// Align initial_tls_size to 64 bytes, to not break the 64-byte
-	// alignment of the TLS segment defined in loader.ld.
-	_initial_tls_size = align_up(_initial_tls_size, (size_t)64);
+        // Align initial_tls_size to 64 bytes, to not break the 64-byte
+        // alignment of the TLS segment defined in loader.ld.
+        _initial_tls_size = align_up(_initial_tls_size, (size_t)64);
     }
     if (!static_tls) {
         _initial_tls_size = 0;
@@ -1026,9 +1240,30 @@ void object::init_static_tls()
         if (obj->is_core()) {
             continue;
         }
-        obj->prepare_initial_tls(_initial_tls.get(), _initial_tls_size,
-                                 _initial_tls_offsets);
+        if (obj->is_executable()) {
+            obj->prepare_local_tls(_initial_tls_offsets);
+            elf_debug("Initialized local-exec static TLS for %s\n", obj->pathname().c_str());
+        }
+        else {
+            obj->prepare_initial_tls(_initial_tls.get(), _initial_tls_size,
+                                     _initial_tls_offsets);
+            elf_debug("Initialized initial-exec static TLS for %s of size: 0x%x\n", obj->pathname().c_str(), _initial_tls_size);
+        }
     }
+}
+
+// This allocates single page of memory and sets its permissions so
+// that any read, write or execution attempt would trigger a page fault
+// to indicate to user that application tried to access missing symbol
+// ignored by relocate_rela().
+// TODO: In future this page can store the name addresses for each missing symbol
+// and allow informing user which particular symbol was missing
+void *missing_symbols_page_addr;
+void setup_missing_symbols_detector()
+{
+    missing_symbols_page_addr = mmu::map_anon(nullptr, mmu::page_size, mmu::mmap_populate, mmu::perm_rw);
+    assert(missing_symbols_page_addr);
+    mmu::mprotect(missing_symbols_page_addr, mmu::page_size, 0);
 }
 
 program* s_program;
@@ -1042,9 +1277,12 @@ void create_main_program()
 program::program(void* addr)
     : _next_alloc(addr)
 {
-    _core = std::make_shared<memory_image>(*this, (void*)ELF_IMAGE_START);
+    void *program_base = (void*)(ELF_IMAGE_START + OSV_KERNEL_VM_SHIFT);
+    _core = std::make_shared<memory_image>(*this, program_base);
+    _core->set_base(program_base);
     assert(_core->module_index() == core_module_index);
     _core->load_segments();
+    _core->process_headers();
     set_search_path({"/", "/usr/lib"});
     // Our kernel already supplies the features of a bunch of traditional
     // shared libraries:
@@ -1054,13 +1292,20 @@ program::program(void* addr)
           "libm.so.6",
 #ifdef __x86_64__
           "ld-linux-x86-64.so.2",
+          "libc.musl-x86_64.so.1",
+          // As noted in issue #1040 Boost version 1.69.0 and above is
+          // compiled with hidden visibility, so even if the kernel uses
+          // this library, it will not be visible for the application and
+          // it will need to load its own version of this library.
+#if BOOST_VERSION < 106900
           "libboost_system.so.1.55.0",
-          "libboost_program_options.so.1.55.0",
+#endif
 #endif /* __x86_64__ */
 #ifdef __aarch64__
           "ld-linux-aarch64.so.1",
+#if BOOST_VERSION < 106900
           "libboost_system-mt.so.1.55.0",
-          "libboost_program_options-mt.so.1.55.0",
+#endif
 #endif /* __aarch64__ */
           "libpthread.so.0",
           "libdl.so.2",
@@ -1152,7 +1397,7 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
         auto ef = std::shared_ptr<object>(new file(*this, f, name),
                 [=](object *obj) { remove_object(obj); });
         ef->set_base(_next_alloc);
-        ef->setprivate(true);
+        ef->set_visibility(ThreadOnly);
         // We need to push the object at the end of the list (so that the main
         // shared object gets searched before the shared libraries it uses),
         // with one exception: the kernel needs to remain at the end of the
@@ -1166,7 +1411,9 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
         _modules_rcu.assign(new_modules.release());
         osv::rcu_dispose(old_modules);
         ef->load_segments();
-        _next_alloc = ef->end();
+        ef->process_headers();
+        if (!ef->is_non_pie_executable())
+           _next_alloc = ef->end();
         add_debugger_obj(ef.get());
         loaded_objects.push_back(ef);
         ef->load_needed(loaded_objects);
@@ -1223,13 +1470,13 @@ void program::init_library(int argc, char** argv)
         // first) and finally make the loaded objects visible in search order.
         auto size = loaded_objects.size();
         for (unsigned i = 0; i < size; i++) {
-            loaded_objects[i]->setprivate(true);
+            loaded_objects[i]->set_visibility(ThreadAndItsChildren);
         }
         for (int i = size - 1; i >= 0; i--) {
             loaded_objects[i]->run_init_funcs(argc, argv);
         }
         for (unsigned i = 0; i < size; i++) {
-            loaded_objects[i]->setprivate(false);
+            loaded_objects[i]->set_visibility(Public);
         }
         _loaded_objects_stack.pop();
     }
@@ -1295,14 +1542,14 @@ void program::del_debugger_obj(object* obj)
     }
 }
 
-symbol_module program::lookup(const char* name)
+symbol_module program::lookup(const char* name, object* seeker)
 {
     trace_elf_lookup(name);
     symbol_module ret(nullptr,nullptr);
     with_modules([&](const elf::program::modules_list &ml)
     {
         for (auto module : ml.objects) {
-            if (auto sym = module->lookup_symbol(name)) {
+            if (auto sym = module->lookup_symbol(name, seeker == module)) {
                 ret = symbol_module(sym, module);
                 return;
             }
@@ -1311,9 +1558,41 @@ symbol_module program::lookup(const char* name)
     return ret;
 }
 
+symbol_module program::lookup_next(const char* name, const void* retaddr)
+{
+    trace_elf_lookup_next(name);
+    symbol_module ret(nullptr,nullptr);
+    if (retaddr == nullptr) {
+        return ret;
+    }
+    with_modules([&](const elf::program::modules_list &ml)
+    {
+        auto start = ml.objects.end();
+        for (auto it = ml.objects.begin(), end = ml.objects.end(); it != end; ++it) {
+            auto module = *it;
+            if (module->contains_addr(retaddr)) {
+                start = it;
+                break;
+            }
+        }
+        if (start == ml.objects.end()) {
+            return;
+        }
+        start = ++start;
+        for (auto it = start, end = ml.objects.end(); it != end; ++it) {
+            auto module = *it;
+            if (auto sym = module->lookup_symbol(name, false)) {
+                ret = symbol_module(sym, module);
+                break;
+            }
+        }
+    });
+    return ret;
+}
+
 void* program::do_lookup_function(const char* name)
 {
-    auto sym = lookup(name);
+    auto sym = lookup(name, nullptr);
     if (!sym.symbol) {
         throw std::runtime_error("symbol not found " + demangle(name));
     }
@@ -1581,6 +1860,7 @@ struct module_and_offset {
 
 char *object::setup_tls()
 {
+    elf_debug("Setting up dynamic TLS of %d bytes\n", _tls_init_size + _tls_uninit_size);
     return (char *) sched::thread::current()->setup_tls(
             _module_index, _tls_segment, _tls_init_size, _tls_uninit_size);
 }

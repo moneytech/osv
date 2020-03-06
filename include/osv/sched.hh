@@ -25,6 +25,7 @@
 #include <osv/rcu.hh>
 #include <osv/clock.hh>
 #include <osv/timer-set.hh>
+#include <string.h>
 
 typedef float runtime_t;
 
@@ -359,7 +360,7 @@ public:
             return *this;
         }
         attr& name(std::string n) {
-            strncpy(_name.data(), n.data(), sizeof(_name) - 1);
+            strlcpy(_name.data(), n.data(), sizeof(_name));
             return *this;
         }
     };
@@ -632,6 +633,10 @@ public:
     {
         return static_cast<T*>(do_remote_thread_local_var(var));
     }
+    unsigned int parent_id() const
+    {
+        return _parent_id;
+    }
 private:
     virtual void timer_fired() override;
     struct detached_state;
@@ -676,7 +681,7 @@ private:
     struct detached_state {
         explicit detached_state(thread* t) : t(t) {}
         thread* t;
-        cpu* _cpu;
+        cpu* _cpu = nullptr;
         bool lock_sent = false;   // send_lock() was called for us
         std::atomic<status> st = { status::unstarted };
     };
@@ -768,6 +773,7 @@ private:
     inline void cputime_estimator_get(
             osv::clock::uptime::time_point &running_since,
             osv::clock::uptime::duration &total_cpu_time);
+    unsigned int _parent_id;
 };
 
 class thread_handle {

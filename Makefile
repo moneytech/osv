@@ -112,16 +112,12 @@ endif
 #   musl/ -  for some of the header files (symbolic links in include/api) and
 #            some of the source files ($(musl) below).
 #   external/x64/acpica - for the ACPICA library (see $(acpi) below).
-#   external/x64/openjdk.bin - for $(java-targets) below.
 # Additional submodules are need when certain make parameters are used.
 ifeq (,$(wildcard musl/include))
     $(error Missing musl/ directory. Please run "git submodule update --init --recursive")
 endif
 ifeq (,$(wildcard external/x64/acpica/source))
     $(error Missing external/x64/acpica/ directory. Please run "git submodule update --init --recursive")
-endif
-ifeq (,$(wildcard external/x64/openjdk.bin/usr))
-    $(error Missing external/x64/openjdk.bin/ directory. Please run "git submodule update --init --recursive")
 endif
 
 # This makefile wraps all commands with the $(quiet) or $(very-quiet) macros
@@ -132,6 +128,9 @@ quiet = $(if $V, $1, @echo " $2"; $1)
 very-quiet = $(if $V, $1, @$1)
 
 all: $(out)/loader.img links
+ifeq ($(arch),x64)
+all: $(out)/vmlinuz.bin
+endif
 .PHONY: all
 
 links:
@@ -228,12 +227,8 @@ local-includes =
 INCLUDES = $(local-includes) -Iarch/$(arch) -I. -Iinclude  -Iarch/common
 INCLUDES += -isystem include/glibc-compat
 
-glibcbase = $(CURDIR)/external/$(arch)/glibc.bin
-gccbase = $(CURDIR)/external/$(arch)/gcc.bin
-miscbase = $(CURDIR)/external/$(arch)/misc.bin
-jdkbase := $(shell find $(CURDIR)/external/$(arch)/openjdk.bin/usr/lib/jvm \
-                         -maxdepth 1 -type d -name 'java*')
-
+gccbase = external/$(arch)/gcc.bin
+miscbase = external/$(arch)/misc.bin
 
 ifeq ($(gcc_include_env), external)
   gcc-inc-base := $(dir $(shell find $(gccbase)/ -name vector | grep -v -e debug/vector$$ -e profile/vector$$))
@@ -309,14 +304,14 @@ gcc-sysroot = $(if $(CROSS_PREFIX), --sysroot external/$(arch)/gcc.bin) \
 # To add something that will *not* be part of the main kernel, you can do:
 #
 #   mydir/*.o EXTRA_FLAGS = <MY_STUFF>
-EXTRA_FLAGS = -D__OSV_CORE__ -DOSV_KERNEL_BASE=$(kernel_base) -DOSV_LZKERNEL_BASE=$(lzkernel_base)
+EXTRA_FLAGS = -D__OSV_CORE__ -DOSV_KERNEL_BASE=$(kernel_base) -DOSV_KERNEL_VM_BASE=$(kernel_vm_base) \
+	-DOSV_KERNEL_VM_SHIFT=$(kernel_vm_shift) -DOSV_LZKERNEL_BASE=$(lzkernel_base)
 EXTRA_LIBS =
 COMMON = $(autodepend) -g -Wall -Wno-pointer-arith $(CFLAGS_WERROR) -Wformat=0 -Wno-format-security \
 	-D __BSD_VISIBLE=1 -U _FORTIFY_SOURCE -fno-stack-protector $(INCLUDES) \
 	$(kernel-defines) \
 	-fno-omit-frame-pointer $(compiler-specific) \
 	-include compiler/include/intrinsics.hh \
-	$(do-sys-includes) \
 	$(arch-cflags) $(conf-opt) $(acpi-defines) $(tracing-flags) $(gcc-sysroot) \
 	$(configuration) -D__OSV__ -D__XEN_INTERFACE_VERSION__="0x00030207" -DARCH_STRING=$(ARCH_STR) $(EXTRA_FLAGS)
 ifeq ($(gcc_include_env), external)
@@ -369,7 +364,7 @@ $(out)/%.o: %.c | generated-headers
 
 $(out)/%.o: %.S
 	$(makedir)
-	$(call quiet, $(CXX) $(CXXFLAGS) $(ASFLAGS) -c -o $@ $<, AS $*.s)
+	$(call quiet, $(CXX) $(CXXFLAGS) $(ASFLAGS) -c -o $@ $<, AS $*.S)
 
 $(out)/%.o: %.s
 	$(makedir)
@@ -380,10 +375,7 @@ $(out)/%.o: %.s
 	$(makedir)
 	$(q-build-so)
 
-sys-includes = $(jdkbase)/include $(jdkbase)/include/linux
 autodepend = -MD -MT $@ -MP
-
-do-sys-includes = $(foreach inc, $(sys-includes), -isystem $(inc))
 
 tools := tools/mkfs/mkfs.so tools/cpiod/cpiod.so
 
@@ -416,16 +408,15 @@ ifeq ($(arch),x64)
 
 # kernel_base is where the kernel will be loaded after uncompression.
 # lzkernel_base is where the compressed kernel is loaded from disk.
-# As issue #872 explains, lzkernel_base must be chosen high enough for
-# (lzkernel_base - kernel_base) to be bigger than the kernel's size.
-# On the other hand, don't increase lzkernel_base too much, because it puts
-# a lower limit on the VM's RAM size.
-# Below we verify that the compiled kernel isn't too big given the current
-# setting of these paramters; Otherwise we recommend to increase lzkernel_base.
 kernel_base := 0x200000
-lzkernel_base := 0x1800000
+lzkernel_base := 0x100000
+kernel_vm_base := 0x40200000
 
+# the default of 64 bytes can be overridden by passing the app_local_exec_tls_size
+# environment variable to the make or scripts/build
+app_local_exec_tls_size := 0x40
 
+$(out)/arch/x64/boot16.o: $(out)/lzloader.elf
 $(out)/boot.bin: arch/x64/boot16.ld $(out)/arch/x64/boot16.o
 	$(call quiet, $(LD) -o $@ -T $^, LD $@)
 
@@ -438,11 +429,19 @@ $(out)/loader.img: $(out)/boot.bin $(out)/lzloader.elf
 	$(call quiet, scripts/imgedit.py setsize "-f raw $@" $(image-size), IMGEDIT $@)
 	$(call quiet, scripts/imgedit.py setargs "-f raw $@" $(cmdline), IMGEDIT $@)
 
-$(out)/loader.bin: $(out)/arch/x64/boot32.o arch/x64/loader32.ld
+kernel_size = $(shell stat --printf %s $(out)/loader-stripped.elf)
+
+$(out)/arch/x64/vmlinuz-boot32.o: $(out)/loader-stripped.elf
+$(out)/arch/x64/vmlinuz-boot32.o: ASFLAGS += -I$(out) -DOSV_KERNEL_SIZE=$(kernel_size)
+
+$(out)/vmlinuz-boot.bin: $(out)/arch/x64/vmlinuz-boot32.o arch/x64/vmlinuz-boot.ld
 	$(call quiet, $(LD) -nostartfiles -static -nodefaultlibs -o $@ \
 	                $(filter-out %.bin, $(^:%.ld=-T %.ld)), LD $@)
 
-$(out)/arch/x64/boot32.o: $(out)/loader.elf
+$(out)/vmlinuz.bin: $(out)/vmlinuz-boot.bin $(out)/loader-stripped.elf
+	$(call quiet, dd if=$(out)/vmlinuz-boot.bin of=$@ > /dev/null 2>&1, DD vmlinuz.bin vmlinuz-boot.bin)
+	$(call quiet, dd if=$(out)/loader-stripped.elf of=$@ conv=notrunc seek=4 > /dev/null 2>&1, \
+		DD vmlinuz.bin loader-stripped.elf)
 
 $(out)/fastlz/fastlz.o:
 	$(makedir)
@@ -462,9 +461,9 @@ $(out)/fastlz/lzloader.o: fastlz/lzloader.cc | generated-headers
 
 $(out)/lzloader.elf: $(out)/loader-stripped.elf.lz.o $(out)/fastlz/lzloader.o arch/x64/lzloader.ld \
 	$(out)/fastlz/fastlz.o
-	$(call very-quiet, scripts/check-image-size.sh $(out)/loader-stripped.elf $(shell bash -c 'echo $$(($(lzkernel_base)-$(kernel_base)))'))
+	$(call very-quiet, scripts/check-image-size.sh $(out)/loader-stripped.elf)
 	$(call quiet, $(LD) -o $@ --defsym=OSV_LZKERNEL_BASE=$(lzkernel_base) \
-		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags \
+		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags -z max-page-size=4096 \
 		-T arch/x64/lzloader.ld \
 		$(filter %.o, $^), LINK lzloader.elf)
 	$(call quiet, truncate -s %32768 $@, ALIGN lzloader.elf)
@@ -474,13 +473,15 @@ acpi-defines = -DACPI_MACHINE_WIDTH=64 -DACPI_USE_LOCAL_CACHE
 acpi-source := $(shell find external/$(arch)/acpica/source/components -type f -name '*.c')
 acpi = $(patsubst %.c, %.o, $(acpi-source))
 
-$(acpi:%=$(out)/%): CFLAGS += -fno-strict-aliasing
+$(acpi:%=$(out)/%): CFLAGS += -fno-strict-aliasing -Wno-stringop-truncation
 
 endif # x64
 
 ifeq ($(arch),aarch64)
 
 kernel_base := 0x40080000
+kernel_vm_base := 0x40080000
+app_local_exec_tls_size := 0x0
 
 include $(libfdt_base)/Makefile.libfdt
 libfdt-source := $(patsubst %.c, $(libfdt_base)/%.c, $(LIBFDT_SRCS))
@@ -500,6 +501,8 @@ $(out)/loader.img: $(out)/preboot.bin $(out)/loader-stripped.elf
 	$(call quiet, scripts/imgedit.py setargs "-f raw $@" $(cmdline), IMGEDIT $@)
 
 endif # aarch64
+
+kernel_vm_shift := $(shell printf "0x%X" $(shell expr $$(( $(kernel_vm_base) - $(kernel_base) )) ))
 
 $(out)/bsd/sys/crypto/rijndael/rijndael-api-fst.o: COMMON+=-fno-strict-aliasing
 $(out)/bsd/sys/crypto/sha2/sha2.o: COMMON+=-fno-strict-aliasing
@@ -802,9 +805,6 @@ drivers += drivers/clock.o
 drivers += drivers/clock-common.o
 drivers += drivers/clockevent.o
 drivers += core/elf.o
-drivers += java/jvm/jvm_balloon.o
-drivers += java/jvm/java_api.o
-drivers += java/jvm/jni_helpers.o
 drivers += drivers/random.o
 drivers += drivers/zfs.o
 drivers += drivers/null.o
@@ -820,14 +820,16 @@ drivers += $(libtsm)
 drivers += drivers/vga.o drivers/kbd.o drivers/isa-serial.o
 drivers += arch/$(arch)/pvclock-abi.o
 drivers += drivers/virtio.o
+drivers += drivers/virtio-pci-device.o
 drivers += drivers/virtio-vring.o
+drivers += drivers/virtio-mmio.o
 drivers += drivers/virtio-net.o
-drivers += drivers/virtio-assign.o
 drivers += drivers/vmxnet3.o
 drivers += drivers/vmxnet3-queues.o
 drivers += drivers/virtio-blk.o
 drivers += drivers/virtio-scsi.o
 drivers += drivers/virtio-rng.o
+drivers += drivers/virtio-fs.o
 drivers += drivers/kvmclock.o drivers/xenclock.o drivers/hypervclock.o
 drivers += drivers/acpi.o
 drivers += drivers/hpet.o
@@ -845,10 +847,12 @@ ifeq ($(arch),aarch64)
 drivers += drivers/pl011.o
 drivers += drivers/xenconsole.o
 drivers += drivers/virtio.o
+drivers += drivers/virtio-pci-device.o
 drivers += drivers/virtio-vring.o
 drivers += drivers/virtio-rng.o
 drivers += drivers/virtio-blk.o
 drivers += drivers/virtio-net.o
+drivers += drivers/virtio-fs.o
 endif # aarch64
 
 objects += arch/$(arch)/arch-trace.o
@@ -893,6 +897,8 @@ objects += arch/x64/ioapic.o
 objects += arch/x64/apic.o
 objects += arch/x64/apic-clock.o
 objects += arch/x64/entry-xen.o
+objects += arch/x64/vmlinux.o
+objects += arch/x64/vmlinux-boot64.o
 objects += core/sampler.o
 objects += $(acpi)
 endif # x64
@@ -941,6 +947,7 @@ objects += core/app.o
 objects += core/libaio.o
 objects += core/osv_execve.o
 objects += core/osv_c_wrappers.o
+objects += core/options.o
 
 #include $(src)/libc/build.mk:
 libc =
@@ -1303,6 +1310,7 @@ musl += math/tgammal.o
 musl += math/trunc.o
 musl += math/truncf.o
 musl += math/truncl.o
+libc += math/aliases.o
 
 # Issue #867: Gcc 4.8.4 has a bug where it optimizes the trivial round-
 # related functions incorrectly - it appears to convert calls to any
@@ -1321,11 +1329,12 @@ $(out)/musl/src/math/llroundl.o: conf-opt := $(conf-opt) -O0
 musl += misc/a64l.o
 libc += misc/basename.o
 musl += misc/dirname.o
+libc += misc/error.o
 libc += misc/ffs.o
 musl += misc/get_current_dir_name.o
 libc += misc/gethostid.o
-musl += misc/getopt.o
-musl += misc/getopt_long.o
+libc += misc/getopt.o
+libc += misc/getopt_long.o
 musl += misc/getsubopt.o
 libc += misc/realpath.o
 libc += misc/backtrace.o
@@ -1510,7 +1519,7 @@ musl += stdio/setlinebuf.o
 musl += stdio/setvbuf.o
 musl += stdio/snprintf.o
 musl += stdio/sprintf.o
-musl += stdio/sscanf.o
+libc += stdio/sscanf.o
 libc += stdio/stderr.o
 libc += stdio/stdin.o
 libc += stdio/stdout.o
@@ -1563,6 +1572,8 @@ libc += stdlib/strtod.o
 libc += stdlib/wcstol.o
 
 libc += string/__memcpy_chk.o
+libc += string/explicit_bzero.o
+libc += string/__explicit_bzero_chk.o
 musl += string/bcmp.o
 musl += string/bcopy.o
 musl += string/bzero.o
@@ -1785,7 +1796,12 @@ fs_objs += rofs/rofs_vfsops.o \
 	rofs/rofs_cache.o \
 	rofs/rofs_common.o
 
+fs_objs += virtiofs/virtiofs_vfsops.o \
+	virtiofs/virtiofs_vnops.o
+
+fs_objs += pseudofs/pseudofs.o
 fs_objs += procfs/procfs_vnops.o
+fs_objs += sysfs/sysfs_vnops.o
 
 objects += $(addprefix fs/, $(fs_objs))
 objects += $(addprefix libc/, $(libc))
@@ -1842,8 +1858,7 @@ else
     boost-includes = -isystem $(miscbase)/usr/include
 endif
 
-boost-libs := $(boost-lib-dir)/libboost_program_options$(boost-mt).a \
-              $(boost-lib-dir)/libboost_system$(boost-mt).a
+boost-libs := $(boost-lib-dir)/libboost_system$(boost-mt).a
 
 ifeq ($(nfs), true)
 	nfs-lib = $(out)/libnfs.a
@@ -1865,14 +1880,22 @@ stage1_targets = $(out)/arch/$(arch)/boot.o $(out)/loader.o $(out)/runtime.o $(d
 stage1: $(stage1_targets) links
 .PHONY: stage1
 
-$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/bootfs.o
+loader_options_dep = $(out)/arch/$(arch)/loader_options.ld
+$(loader_options_dep): stage1
+	$(makedir)
+	@if [ '$(shell cat $(loader_options_dep) 2>&1)' != 'APP_LOCAL_EXEC_TLS_SIZE = $(app_local_exec_tls_size);' ]; then \
+		echo -n "APP_LOCAL_EXEC_TLS_SIZE = $(app_local_exec_tls_size);" > $(loader_options_dep) ; \
+	fi
+
+$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(out)/bootfs.o $(loader_options_dep)
 	$(call quiet, $(LD) -o $@ --defsym=OSV_KERNEL_BASE=$(kernel_base) \
-		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags \
+	    --defsym=OSV_KERNEL_VM_BASE=$(kernel_vm_base) --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift) \
+		-Bdynamic --export-dynamic --eh-frame-hdr --enable-new-dtags -L$(out)/arch/$(arch) \
 	    $(^:%.ld=-T %.ld) \
 	    --whole-archive \
-	      $(libstdc++.a) $(libgcc.a) $(libgcc_eh.a) \
+	      $(libstdc++.a) $(libgcc_eh.a) \
 	      $(boost-libs) \
-	    --no-whole-archive, \
+	    --no-whole-archive $(libgcc.a), \
 		LINK loader.elf)
 	@# Build libosv.so matching this loader.elf. This is not a separate
 	@# rule because that caused bug #545.
@@ -1905,11 +1928,16 @@ $(bootfs_manifest_dep): phony
 		echo -n $(bootfs_manifest) > $(bootfs_manifest_dep) ; \
 	fi
 
+ifeq ($(arch),x64)
+libgcc_s_dir := $(dir $(shell $(CC) -print-file-name=libgcc_s.so.1))
+else
+libgcc_s_dir := ../../$(gccbase)/lib64
+endif
+
 $(out)/bootfs.bin: scripts/mkbootfs.py $(bootfs_manifest) $(bootfs_manifest_dep) $(tools:%=$(out)/%) \
 		$(out)/zpool.so $(out)/zfs.so $(out)/libenviron.so $(out)/libvdso.so
-	$(call quiet, olddir=`pwd`; cd $(out); $$olddir/scripts/mkbootfs.py -o bootfs.bin -d bootfs.bin.d -m $$olddir/$(bootfs_manifest) \
-		-D jdkbase=$(jdkbase) -D gccbase=$(gccbase) -D \
-		glibcbase=$(glibcbase) -D miscbase=$(miscbase), MKBOOTFS $@)
+	$(call quiet, olddir=`pwd`; cd $(out); "$$olddir"/scripts/mkbootfs.py -o bootfs.bin -d bootfs.bin.d -m "$$olddir"/$(bootfs_manifest) \
+		-D libgcc_s_dir=$(libgcc_s_dir), MKBOOTFS $@)
 
 $(out)/bootfs.o: $(out)/bootfs.bin
 $(out)/bootfs.o: ASFLAGS += -I$(out)

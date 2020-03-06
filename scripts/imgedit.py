@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 import sys, struct
 import subprocess
@@ -31,14 +31,15 @@ def chs(x):
     return c, h, s
 
 def read_chars_up_to_null(file):
-    while True:
+    keep_reading = True
+    while keep_reading:
         try:
-            c = file.read(1)
+            c = file.read(1).decode()
             if c == '\0':
-                raise StopIteration
+                keep_reading = False
             yield c
         except ValueError:
-            raise StopIteration
+            keep_reading = False
 
 def read_cstr(file):
     return ''.join(read_chars_up_to_null(file))
@@ -50,17 +51,20 @@ def write_cstr(file, str):
 class nbd_file(object):
 
     def __init__(self, filename):
+        fileformat = []
+        if filename.startswith("-f raw "):
+            filename = filename[7:]
+            fileformat = ['-f', 'raw']
         self._filename = filename
         self._offset = 0
         self._buf = None
         self._closed = True
         nbd_port = randint(10809, 20809)
-        self._process = subprocess.Popen("qemu-nbd -p %d %s" % (nbd_port, filename),
-                                        shell=True, stdout=_devnull)
+        self._process = subprocess.Popen(["qemu-nbd", "-b", "127.0.0.1", "-p", str(nbd_port)] + fileformat + [filename], shell=False, stdout=_devnull)
         # wait for qemu-nbd to start: this thing doesn't tell anything on stdout
         while True:
             try:
-                self._client = nbd_client("localhost", nbd_port)
+                self._client = nbd_client("127.0.0.1", nbd_port)
                 break
             except:
                 if self._process.poll() != None:

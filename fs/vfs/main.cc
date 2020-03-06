@@ -587,10 +587,6 @@ extern "C"
 int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *st,
         int flags)
 {
-    if (flags & AT_SYMLINK_NOFOLLOW) {
-        UNIMPLEMENTED("fstatat() with AT_SYMLINK_NOFOLLOW");
-    }
-
     if (pathname[0] == '/' || dirfd == AT_FDCWD) {
         return stat(pathname, st);
     }
@@ -618,7 +614,12 @@ int __fxstatat(int ver, int dirfd, const char *pathname, struct stat *st,
     strlcat(p, "/", PATH_MAX);
     strlcat(p, pathname, PATH_MAX);
 
-    error = stat(p, st);
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        error = lstat(p, st);
+    }
+    else {
+        error = stat(p, st);
+    }
 
     vn_unlock(vp);
     fdrop(fp);
@@ -1453,6 +1454,10 @@ int fcntl(int fd, int cmd, int arg)
     // ignored in OSv anyway, as it doesn't support exec().
     switch (cmd) {
     case F_DUPFD:
+    // On Linux F_DUPFD_CLOEXEC is used to affect behavior of duplicated file descriptor
+    // across execve() boundaries, but on OSv there is single process so we make it
+    // behave exactly like F_DUPFD does
+    case F_DUPFD_CLOEXEC:
         error = _fdalloc(fp, &ret, arg);
         if (error)
             goto out_errno;
@@ -1513,6 +1518,8 @@ int fcntl(int fd, int cmd, int arg)
     errno = error;
     return -1;
 }
+
+LFS64(fcntl);
 
 TRACEPOINT(trace_vfs_access, "\"%s\" 0%0o", const char*, int);
 TRACEPOINT(trace_vfs_access_ret, "");
@@ -1756,6 +1763,39 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsize)
     out_errno:
     errno = error;
     return -1;
+}
+
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsize)
+{
+    if (pathname[0] == '/' || dirfd == AT_FDCWD) {
+        return readlink(pathname, buf, bufsize);
+    }
+
+    struct file *fp;
+    int error = fget(dirfd, &fp);
+    if (error) {
+        errno = error;
+        return -1;
+    }
+
+    struct vnode *vp = fp->f_dentry->d_vnode;
+    vn_lock(vp);
+
+    std::unique_ptr<char []> up (new char[PATH_MAX]);
+    char *p = up.get();
+
+    /* build absolute path */
+    strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
+    strlcat(p, fp->f_dentry->d_path, PATH_MAX);
+    strlcat(p, "/", PATH_MAX);
+    strlcat(p, pathname, PATH_MAX);
+
+    error = readlink(p, buf, bufsize);
+
+    vn_unlock(vp);
+    fdrop(fp);
+
+    return error;
 }
 
 TRACEPOINT(trace_vfs_fallocate, "%d %d 0x%x 0x%x", int, int, loff_t, loff_t);
@@ -2132,6 +2172,7 @@ struct bootfs_metadata {
 
 extern char bootfs_start;
 
+int ramfs_set_file_data(struct vnode *vp, const void *data, size_t size);
 void unpack_bootfs(void)
 {
     struct bootfs_metadata *md = (struct bootfs_metadata *)&bootfs_start;
@@ -2173,13 +2214,22 @@ void unpack_bootfs(void)
             sys_panic("unpack_bootfs failed");
         }
 
-        ret = write(fd, &bootfs_start + md[i].offset, md[i].size);
-        if (ret != md[i].size) {
-            kprintf("write failed, ret = %d, errno = %d\n",
-                    ret, errno);
+        struct file *fp;
+        int error = fget(fd, &fp);
+        if (error) {
+            kprintf("couldn't fget %s: %d\n",
+                    md[i].name, error);
             sys_panic("unpack_bootfs failed");
         }
 
+        struct vnode *vp = fp->f_dentry->d_vnode;
+        ret = ramfs_set_file_data(vp, &bootfs_start + md[i].offset, md[i].size);
+        if (ret) {
+            kprintf("ramfs_set_file_data failed, ret = %d\n", ret);
+            sys_panic("unpack_bootfs failed");
+        }
+
+        fdrop(fp);
         close(fd);
     }
 }
@@ -2308,7 +2358,7 @@ extern "C" int mount_rofs_rootfs(bool pivot_root)
     return 0;
 }
 
-extern "C" void mount_zfs_rootfs(bool pivot_root)
+extern "C" void mount_zfs_rootfs(bool pivot_root, bool extra_zfs_pools)
 {
     if (mkdir("/zfs", 0755) < 0)
         kprintf("failed to create /zfs, error = %s\n", strerror(errno));
@@ -2324,7 +2374,9 @@ extern "C" void mount_zfs_rootfs(bool pivot_root)
 
     pivot_rootfs("/zfs");
 
-    import_extra_zfs_pools();
+    if (extra_zfs_pools) {
+        import_extra_zfs_pools();
+    }
 }
 
 extern "C" void unmount_rootfs(void)

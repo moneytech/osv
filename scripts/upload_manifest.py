@@ -1,18 +1,19 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 import optparse, os, subprocess, socket, threading, stat, sys
 from manifest_common import add_var, expand, unsymlink, read_manifest, defines, strip_file
+from contextlib import closing
 
-try:
-    import StringIO
-    # This works on Python 2
-    StringIO = StringIO.StringIO
-except ImportError:
-    import io
-    # This works on Python 3
-    StringIO = io.StringIO
+import io
+StringIO = io.StringIO
 
-def upload(osv, manifest, depends):
+def find_free_port():
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('localhost', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+def upload(osv, manifest, depends, port):
     manifest = [(x, y % defines) for (x, y) in manifest]
     files = list(expand(manifest))
     files = [(x, unsymlink(y)) for (x, y) in files]
@@ -25,7 +26,7 @@ def upload(osv, manifest, depends):
         os.write(sys.stdout.fileno(), line)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect(("127.0.0.1", 10000))
+    s.connect(("127.0.0.1", port))
 
     # We'll want to read the rest of the guest's output, so that it doesn't
     # hang, and so the user can see what's happening. Easiest to do this with
@@ -46,8 +47,7 @@ def upload(osv, manifest, depends):
     def cpio_field(number, length):
         return ("%.*x" % (length, number)).encode()
     def cpio_header(filename, mode, filesize):
-        if sys.version_info >= (3, 0, 0):
-            filename = filename.encode("utf-8")
+        filename = filename.encode("utf-8")
         return (b"070701"                         # magic
                 + cpio_field(0, 8)                # inode
                 + cpio_field(mode, 8)             # mode
@@ -146,9 +146,10 @@ def main():
     depends.write('%s: \\\n' % (options.output,))
 
     image_path = os.path.abspath(options.output)
-    osv = subprocess.Popen('cd ../..; scripts/run.py --vnc none -m 512 -c1 -i %s -u -s -e "--norandom --nomount --noinit /tools/mkfs.so; /tools/cpiod.so --prefix /zfs/zfs/; /zfs.so set compression=off osv" --forward tcp::10000-:10000' % image_path, shell=True, stdout=subprocess.PIPE)
+    upload_port = find_free_port()
+    osv = subprocess.Popen('cd ../..; scripts/run.py --vnc none -m 512 -c1 -i "%s" --block-device-cache unsafe -s -e "--norandom --nomount --noinit /tools/mkfs.so; /tools/cpiod.so --prefix /zfs/zfs/; /zfs.so set compression=off osv" --forward tcp:127.0.0.1:%s-:10000' % (image_path,upload_port), shell=True, stdout=subprocess.PIPE)
 
-    upload(osv, manifest, depends)
+    upload(osv, manifest, depends, upload_port)
 
     ret = osv.wait()
     if ret != 0:

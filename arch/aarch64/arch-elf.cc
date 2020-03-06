@@ -17,6 +17,7 @@ bool arch_init_reloc_dyn(struct init_table *t, u32 type, u32 sym,
     case R_AARCH64_NONE2:
         break;
     case R_AARCH64_GLOB_DAT:
+    case R_AARCH64_JUMP_SLOT:
         *static_cast<u64*>(addr) = t->dyn_tabs.lookup(sym)->st_value + addend;
         break;
     case R_AARCH64_TLS_TPREL64:
@@ -58,14 +59,23 @@ bool object::arch_relocate_rela(u32 type, u32 sym, void *addr,
     return true;
 }
 
-bool object::arch_relocate_jump_slot(u32 sym, void *addr, Elf64_Sxword addend)
+bool object::arch_relocate_jump_slot(symbol_module& sym, void *addr, Elf64_Sxword addend)
 {
-    *static_cast<void**>(addr) = symbol(sym).relocated_addr() + addend;
-    return true;
+    if (sym.symbol) {
+        *static_cast<void**>(addr) = sym.relocated_addr() + addend;
+        return true;
+    } else {
+        return false;
+    }
 }
 
 void object::prepare_initial_tls(void* buffer, size_t size,
                                  std::vector<ptrdiff_t>& offsets)
+{
+    abort();
+}
+
+void object::prepare_local_tls(std::vector<ptrdiff_t>& offsets)
 {
     abort();
 }
